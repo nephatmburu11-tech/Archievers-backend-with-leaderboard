@@ -1,46 +1,46 @@
+// routes/notes.js — Supabase version
 const express = require('express');
-const { readDB, writeDB } = require('../db');
+const supabase = require('../db'); // Supabase client
 const { requireAuth, optionalAuth } = require('../middleware/auth');
 
 const router = express.Router();
 
-// ══════════════════════════════════════════════════════════════
+// ──────────────────────────────────────────────────────────────
 // GET /api/notes
 // List notes with optional search + filter
 // Query params: q (search), subject, sort (newest|popular), page, limit
-// ══════════════════════════════════════════════════════════════
-router.get('/', optionalAuth, (req, res, next) => {
+// ──────────────────────────────────────────────────────────────
+router.get('/', optionalAuth, async (req, res, next) => {
   try {
     const { q = '', subject = 'all', sort = 'newest', page = 1, limit = 20 } = req.query;
-    const db = readDB();
+    const pageNum = Math.max(1, parseInt(page));
+    const pageSize = Math.min(50, Math.max(1, parseInt(limit)));
 
-    let notes = db.notes.filter(n => n.status === 'published');
+    // Build Supabase query
+    let query = supabase.from('notes').select('*').eq('status', 'published');
+
+    if (subject !== 'all') query = query.eq('subject', subject.toLowerCase());
+    const { data: allNotes, error } = await query;
+    if (error) throw error;
 
     // Search filter
+    let notes = allNotes;
     if (q.trim()) {
-      const query = q.toLowerCase();
+      const search = q.toLowerCase();
       notes = notes.filter(n =>
-        n.title.toLowerCase().includes(query) ||
-        n.description.toLowerCase().includes(query) ||
-        n.uploaderName.toLowerCase().includes(query)
+        n.title.toLowerCase().includes(search) ||
+        n.description.toLowerCase().includes(search) ||
+        n.uploader_name.toLowerCase().includes(search)
       );
-    }
-
-    // Subject filter
-    if (subject !== 'all') {
-      notes = notes.filter(n => n.subject === subject.toLowerCase());
     }
 
     // Sort
     if (sort === 'popular') {
       notes.sort((a, b) => b.downloads - a.downloads);
     } else {
-      notes.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+      notes.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     }
 
-    // Pagination
-    const pageNum = Math.max(1, parseInt(page));
-    const pageSize = Math.min(50, Math.max(1, parseInt(limit)));
     const total = notes.length;
     const paginated = notes.slice((pageNum - 1) * pageSize, pageNum * pageSize);
 
@@ -50,14 +50,13 @@ router.get('/', optionalAuth, (req, res, next) => {
         title: n.title,
         subject: n.subject,
         description: n.description,
-        originalName: n.originalName,
-        fileSize: n.fileSize,
-        uploaderName: n.uploaderName,
+        originalName: n.original_name,
+        fileSize: n.file_size,
+        uploaderName: n.uploader_name,
         downloads: n.downloads,
-        createdAt: n.createdAt,
+        createdAt: n.created_at,
         downloadUrl: `/api/upload/download/${n.id}`,
-        // Only show uploader ID if logged in
-        ...(req.user ? { uploaderId: n.uploaderId } : {}),
+        ...(req.user ? { uploaderId: n.uploader_id } : {}),
       })),
       pagination: {
         total,
@@ -71,43 +70,51 @@ router.get('/', optionalAuth, (req, res, next) => {
   }
 });
 
-// ══════════════════════════════════════════════════════════════
-// GET /api/notes/mine
-// Get the logged-in user's uploads
-// ══════════════════════════════════════════════════════════════
-router.get('/mine', requireAuth, (req, res, next) => {
+// ──────────────────────────────────────────────────────────────
+// GET /api/notes/mine — logged-in user's uploads
+// ──────────────────────────────────────────────────────────────
+router.get('/mine', requireAuth, async (req, res, next) => {
   try {
-    const db = readDB();
-    const notes = db.notes
-      .filter(n => n.uploaderId === req.user.id)
-      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-      .map(n => ({
+    const { data: notes, error } = await supabase
+      .from('notes')
+      .select('*')
+      .eq('uploader_id', req.user.id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    res.json({
+      notes: notes.map(n => ({
         id: n.id,
         title: n.title,
         subject: n.subject,
         description: n.description,
-        originalName: n.originalName,
-        fileSize: n.fileSize,
+        originalName: n.original_name,
+        fileSize: n.file_size,
         downloads: n.downloads,
-        createdAt: n.createdAt,
+        createdAt: n.created_at,
         status: n.status,
         downloadUrl: `/api/upload/download/${n.id}`,
-      }));
-
-    res.json({ notes });
+      })),
+    });
   } catch (err) {
     next(err);
   }
 });
 
-// ══════════════════════════════════════════════════════════════
+// ──────────────────────────────────────────────────────────────
 // GET /api/notes/:id — single note detail
-// ══════════════════════════════════════════════════════════════
-router.get('/:id', optionalAuth, (req, res, next) => {
+// ──────────────────────────────────────────────────────────────
+router.get('/:id', optionalAuth, async (req, res, next) => {
   try {
-    const db = readDB();
-    const note = db.notes.find(n => n.id === req.params.id && n.status === 'published');
-    if (!note) return res.status(404).json({ error: 'Note not found.' });
+    const { data: note, error } = await supabase
+      .from('notes')
+      .select('*')
+      .eq('id', req.params.id)
+      .eq('status', 'published')
+      .single();
+
+    if (error || !note) return res.status(404).json({ error: 'Note not found.' });
 
     res.json({
       note: {
@@ -115,11 +122,11 @@ router.get('/:id', optionalAuth, (req, res, next) => {
         title: note.title,
         subject: note.subject,
         description: note.description,
-        originalName: note.originalName,
-        fileSize: note.fileSize,
-        uploaderName: note.uploaderName,
+        originalName: note.original_name,
+        fileSize: note.file_size,
+        uploaderName: note.uploader_name,
         downloads: note.downloads,
-        createdAt: note.createdAt,
+        createdAt: note.created_at,
         downloadUrl: `/api/upload/download/${note.id}`,
       },
     });
