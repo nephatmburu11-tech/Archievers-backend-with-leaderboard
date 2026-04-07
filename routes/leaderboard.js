@@ -1,189 +1,127 @@
+// routes/leaderboard.js — Supabase version
 const express = require('express');
-const { readDB } = require('../db');
+const supabase = require('../db'); // Supabase client
 const { optionalAuth } = require('../middleware/auth');
 
 const router = express.Router();
 
-// ══════════════════════════════════════════════════════════════
+// ──────────────────────────────────────────────────────────────
 // GET /api/leaderboard
 // Returns top contributors ranked by total downloads, uploads,
 // and a combined score.
-//
 // Query params:
 //   sort   — "score" (default) | "downloads" | "uploads"
 //   period — "all" (default)   | "month" | "week"
 //   limit  — number of entries to return (default 10, max 50)
-// ══════════════════════════════════════════════════════════════
-router.get('/', optionalAuth, (req, res, next) => {
+// ──────────────────────────────────────────────────────────────
+router.get('/', optionalAuth, async (req, res, next) => {
   try {
-    const {
-      sort = 'score',
-      period = 'all',
-      limit = 10,
-    } = req.query;
-
+    const { sort = 'score', period = 'all', limit = 10 } = req.query;
     const pageSize = Math.min(50, Math.max(1, parseInt(limit) || 10));
-    const db = readDB();
 
-    // ── Date filter ──────────────────────────────────────────
+    // Calculate date filter if period is week/month
     let since = null;
-    if (period === 'week') {
-      since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    } else if (period === 'month') {
-      since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    }
+    if (period === 'week') since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    if (period === 'month') since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
 
-    // Only consider published notes (optionally filtered by period)
-    const notes = db.notes.filter(n => {
-      if (n.status !== 'published') return false;
-      if (since && new Date(n.createdAt) < since) return false;
-      return true;
-    });
+    // Fetch users
+    const { data: users, error: usersError } = await supabase.from('users').select('*');
+    if (usersError) throw usersError;
 
-    // ── Aggregate stats per user ─────────────────────────────
-    // Map: userId → { name, uploads, totalDownloads }
+    // Fetch notes (with optional period filter)
+    let query = supabase.from('notes').select('*').eq('status', 'published');
+    if (since) query = query.gte('created_at', since);
+    const { data: notes, error: notesError } = await query;
+    if (notesError) throw notesError;
+
+    // Aggregate stats
     const statsMap = {};
-
-    // Pre-seed all registered users so people with 0 uploads still exist
-    db.users.forEach(u => {
-      statsMap[u.id] = {
-        userId: u.id,
-        name: u.name,
-        uploads: 0,
-        totalDownloads: 0,
-        score: 0,
-      };
+    users.forEach(u => {
+      statsMap[u.id] = { userId: u.id, name: u.name, uploads: 0, totalDownloads: 0, score: 0 };
     });
 
-    notes.forEach(note => {
-      if (!statsMap[note.uploaderId]) {
-        // Uploader may have been deleted; still credit them by name
-        statsMap[note.uploaderId] = {
-          userId: note.uploaderId,
-          name: note.uploaderName,
-          uploads: 0,
-          totalDownloads: 0,
-          score: 0,
-        };
+    notes.forEach(n => {
+      if (!statsMap[n.uploader_id]) {
+        statsMap[n.uploader_id] = { userId: n.uploader_id, name: n.uploader_name, uploads: 0, totalDownloads: 0, score: 0 };
       }
-      statsMap[note.uploaderId].uploads += 1;
-      statsMap[note.uploaderId].totalDownloads += note.downloads || 0;
+      statsMap[n.uploader_id].uploads += 1;
+      statsMap[n.uploader_id].totalDownloads += n.downloads || 0;
     });
 
-    // ── Score formula ────────────────────────────────────────
-    // score = (downloads × 1) + (uploads × 5)
-    // Adjust weights here if you want a different ranking feel.
     const DOWNLOAD_WEIGHT = 1;
     const UPLOAD_WEIGHT = 5;
 
     const ranked = Object.values(statsMap)
-      .map(entry => ({
-        ...entry,
-        score: entry.totalDownloads * DOWNLOAD_WEIGHT + entry.uploads * UPLOAD_WEIGHT,
-      }))
-      // Only include users who have contributed at least once
+      .map(e => ({ ...e, score: e.totalDownloads * DOWNLOAD_WEIGHT + e.uploads * UPLOAD_WEIGHT }))
       .filter(e => e.uploads > 0 || e.totalDownloads > 0);
 
-    // ── Sort ─────────────────────────────────────────────────
+    // Sort
     const VALID_SORTS = ['score', 'downloads', 'uploads'];
     const sortKey = VALID_SORTS.includes(sort) ? sort : 'score';
-
-    const sortField = {
-      score: 'score',
-      downloads: 'totalDownloads',
-      uploads: 'uploads',
-    }[sortKey];
-
+    const sortField = { score: 'score', downloads: 'totalDownloads', uploads: 'uploads' }[sortKey];
     ranked.sort((a, b) => b[sortField] - a[sortField]);
 
-    // ── Assign ranks (ties share a rank) ─────────────────────
+    // Assign ranks
     let currentRank = 1;
     const withRanks = ranked.map((entry, idx) => {
-      if (idx > 0 && entry[sortField] < ranked[idx - 1][sortField]) {
-        currentRank = idx + 1;
-      }
+      if (idx > 0 && entry[sortField] < ranked[idx - 1][sortField]) currentRank = idx + 1;
       return { rank: currentRank, ...entry };
     });
 
-    // ── Paginate ─────────────────────────────────────────────
     const top = withRanks.slice(0, pageSize);
-
-    // ── Caller's own rank (if logged in) ────────────────────
     let myEntry = null;
-    if (req.user) {
-      const me = withRanks.find(e => e.userId === req.user.id);
-      if (me) {
-        myEntry = me;
-      }
-    }
+    if (req.user) myEntry = withRanks.find(e => e.userId === req.user.id) || null;
 
-    res.json({
-      period,
-      sort: sortKey,
-      total: withRanks.length,
-      leaderboard: top,
-      ...(myEntry ? { myRank: myEntry } : {}),
-    });
+    res.json({ period, sort: sortKey, total: withRanks.length, leaderboard: top, ...(myEntry ? { myRank: myEntry } : {}) });
   } catch (err) {
     next(err);
   }
 });
 
-// ══════════════════════════════════════════════════════════════
+// ──────────────────────────────────────────────────────────────
 // GET /api/leaderboard/user/:userId
 // Public profile of a single user's contribution stats
-// ══════════════════════════════════════════════════════════════
-router.get('/user/:userId', (req, res, next) => {
+// ──────────────────────────────────────────────────────────────
+router.get('/user/:userId', async (req, res, next) => {
   try {
-    const db = readDB();
-    const user = db.users.find(u => u.id === req.params.userId);
-    if (!user) return res.status(404).json({ error: 'User not found.' });
+    const userId = req.params.userId;
 
-    const userNotes = db.notes.filter(
-      n => n.uploaderId === user.id && n.status === 'published'
-    );
+    // Fetch user
+    const { data: users, error: userError } = await supabase.from('users').select('*').eq('id', userId).single();
+    if (userError || !users) return res.status(404).json({ error: 'User not found.' });
+
+    // Fetch their notes
+    const { data: userNotes, error: notesError } = await supabase
+      .from('notes')
+      .select('*')
+      .eq('uploader_id', userId)
+      .eq('status', 'published');
+    if (notesError) throw notesError;
 
     const totalDownloads = userNotes.reduce((sum, n) => sum + (n.downloads || 0), 0);
     const uploads = userNotes.length;
     const score = totalDownloads * 1 + uploads * 5;
 
-    // Rank: count how many other users score higher
-    const allNotes = db.notes.filter(n => n.status === 'published');
+    // Calculate rank
+    const { data: allNotes } = await supabase.from('notes').select('*').eq('status', 'published');
     const scoresMap = {};
     allNotes.forEach(n => {
-      scoresMap[n.uploaderId] = (scoresMap[n.uploaderId] || { uploads: 0, downloads: 0 });
-      scoresMap[n.uploaderId].uploads += 1;
-      scoresMap[n.uploaderId].downloads += n.downloads || 0;
+      scoresMap[n.uploader_id] = scoresMap[n.uploader_id] || { uploads: 0, downloads: 0 };
+      scoresMap[n.uploader_id].uploads += 1;
+      scoresMap[n.uploader_id].downloads += n.downloads || 0;
     });
-    const allScores = Object.values(scoresMap).map(
-      s => s.downloads * 1 + s.uploads * 5
-    );
+    const allScores = Object.values(scoresMap).map(s => s.downloads * 1 + s.uploads * 5);
     const rank = allScores.filter(s => s > score).length + 1;
 
-    // Top 3 notes by downloads
+    // Top 3 notes
     const topNotes = [...userNotes]
       .sort((a, b) => b.downloads - a.downloads)
       .slice(0, 3)
-      .map(n => ({
-        id: n.id,
-        title: n.title,
-        subject: n.subject,
-        downloads: n.downloads,
-        createdAt: n.createdAt,
-      }));
+      .map(n => ({ id: n.id, title: n.title, subject: n.subject, downloads: n.downloads, createdAt: n.created_at }));
 
     res.json({
-      user: {
-        id: user.id,
-        name: user.name,
-        joinedAt: user.createdAt,
-      },
-      stats: {
-        uploads,
-        totalDownloads,
-        score,
-        rank,
-      },
+      user: { id: users.id, name: users.name, joinedAt: users.created_at },
+      stats: { uploads, totalDownloads, score, rank },
       topNotes,
     });
   } catch (err) {
