@@ -1,15 +1,10 @@
+// routes/auth.js — Supabase version
 const express = require('express');
 const bcrypt = require('bcryptjs');
-const { v4: uuid } = require('crypto');
-const { readDB, writeDB } = require('../db');
+const supabase = require('../db'); // Supabase client
 const { signToken, requireAuth } = require('../middleware/auth');
 
 const router = express.Router();
-
-// ── Helper: generate a simple UUID ──────────────────────────
-function newId() {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
-}
 
 // ── Validation helpers ───────────────────────────────────────
 function isValidEmail(e) {
@@ -25,50 +20,54 @@ router.post('/register', async (req, res, next) => {
     const { name, email, password } = req.body;
 
     // Basic validation
-    if (!name || !email || !password) {
+    if (!name || !email || !password)
       return res.status(400).json({ error: 'Name, email, and password are required.' });
-    }
-    if (!isValidEmail(email)) {
+
+    if (!isValidEmail(email))
       return res.status(400).json({ error: 'Invalid email address.' });
-    }
-    if (password.length < 8) {
+
+    if (password.length < 8)
       return res.status(400).json({ error: 'Password must be at least 8 characters.' });
-    }
-    if (name.trim().length < 2) {
+
+    if (name.trim().length < 2)
       return res.status(400).json({ error: 'Name must be at least 2 characters.' });
-    }
 
-    const db = readDB();
+    // Check for existing user
+    const { data: existing, error: fetchError } = await supabase
+      .from('users')
+      .select('id')
+      .eq('email', email.toLowerCase());
 
-    // Check for duplicate email
-    const exists = db.users.find(u => u.email.toLowerCase() === email.toLowerCase());
-    if (exists) {
+    if (fetchError) throw fetchError;
+    if (existing.length > 0)
       return res.status(409).json({ error: 'An account with that email already exists.' });
-    }
 
     // Hash password
     const passwordHash = await bcrypt.hash(password, 12);
 
-    const newUser = {
-      id: newId(),
+    // Insert new user
+    const { data, error } = await supabase.from('users').insert([{
       name: name.trim(),
       email: email.toLowerCase().trim(),
-      passwordHash,
+      password_hash: passwordHash,
       role: 'student', // roles: student | moderator | admin
-      createdAt: new Date().toISOString(),
-    };
+    }]).select().single();
 
-    db.users.push(newUser);
-    writeDB(db);
+    if (error) throw error;
 
-    // Issue token immediately (log them in after register)
-    const token = signToken({ id: newUser.id, email: newUser.email, name: newUser.name, role: newUser.role });
+    const token = signToken({
+      id: data.id,
+      email: data.email,
+      name: data.name,
+      role: data.role
+    });
 
     res.status(201).json({
       message: 'Account created successfully!',
       token,
-      user: { id: newUser.id, name: newUser.name, email: newUser.email, role: newUser.role },
+      user: { id: data.id, name: data.name, email: data.email, role: data.role }
     });
+
   } catch (err) {
     next(err);
   }
@@ -81,84 +80,113 @@ router.post('/register', async (req, res, next) => {
 router.post('/login', async (req, res, next) => {
   try {
     const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password are required.' });
 
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required.' });
-    }
+    // Fetch user by email
+    const { data: users, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email.toLowerCase())
+      .limit(1);
 
-    const db = readDB();
-    const user = db.users.find(u => u.email === email.toLowerCase().trim());
-
-    // Use constant-time comparison (bcrypt) even if user not found to prevent timing attacks
-    const dummyHash = '$2a$12$invalidhashforsecuritypurposesonly.........';
-    const match = user
-      ? await bcrypt.compare(password, user.passwordHash)
-      : await bcrypt.compare(password, dummyHash).then(() => false);
-
-    if (!user || !match) {
+    if (error) throw error;
+    if (!users || users.length === 0)
       return res.status(401).json({ error: 'Invalid email or password.' });
-    }
 
-    const token = signToken({ id: user.id, email: user.email, name: user.name, role: user.role });
+    const user = users[0];
+
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) return res.status(401).json({ error: 'Invalid email or password.' });
+
+    const token = signToken({
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role
+    });
 
     res.json({
       message: 'Login successful!',
       token,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role },
+      user: { id: user.id, name: user.name, email: user.email, role: user.role }
     });
+
   } catch (err) {
     next(err);
   }
 });
 
 // ══════════════════════════════════════════════════════════════
-// GET /api/auth/me  — get current user profile
+// GET /api/auth/me — get current user profile
 // ══════════════════════════════════════════════════════════════
-router.get('/me', requireAuth, (req, res) => {
-  const db = readDB();
-  const user = db.users.find(u => u.id === req.user.id);
-  if (!user) return res.status(404).json({ error: 'User not found.' });
+router.get('/me', requireAuth, async (req, res, next) => {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', req.user.id)
+      .single();
 
-  // Return profile without passwordHash
-  const { passwordHash, ...profile } = user;
-  res.json({ user: profile });
+    if (error) return res.status(404).json({ error: 'User not found.' });
+
+    const { password_hash, ...profile } = data;
+    res.json({ user: profile });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ══════════════════════════════════════════════════════════════
-// PUT /api/auth/me  — update name/email
+// PUT /api/auth/me — update name/email/password
 // ══════════════════════════════════════════════════════════════
 router.put('/me', requireAuth, async (req, res, next) => {
   try {
     const { name, email, currentPassword, newPassword } = req.body;
-    const db = readDB();
-    const idx = db.users.findIndex(u => u.id === req.user.id);
-    if (idx === -1) return res.status(404).json({ error: 'User not found.' });
 
-    const user = db.users[idx];
+    // Fetch user
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', req.user.id)
+      .single();
 
-    // Update name
-    if (name && name.trim().length >= 2) user.name = name.trim();
+    if (error) return res.status(404).json({ error: 'User not found.' });
 
-    // Update email
+    const updates = {};
+
+    if (name && name.trim().length >= 2) updates.name = name.trim();
+
     if (email && isValidEmail(email)) {
-      const taken = db.users.find(u => u.email === email.toLowerCase() && u.id !== user.id);
-      if (taken) return res.status(409).json({ error: 'Email already in use.' });
-      user.email = email.toLowerCase();
+      // Check if email is taken
+      const { data: existing } = await supabase
+        .from('users')
+        .select('id')
+        .eq('email', email.toLowerCase())
+        .neq('id', user.id)
+        .limit(1);
+
+      if (existing.length > 0) return res.status(409).json({ error: 'Email already in use.' });
+      updates.email = email.toLowerCase();
     }
 
-    // Change password (requires currentPassword)
     if (newPassword) {
-      if (!currentPassword) return res.status(400).json({ error: 'Current password required to change password.' });
-      const ok = await bcrypt.compare(currentPassword, user.passwordHash);
-      if (!ok) return res.status(401).json({ error: 'Current password is incorrect.' });
+      if (!currentPassword) return res.status(400).json({ error: 'Current password required.' });
+      const match = await bcrypt.compare(currentPassword, user.password_hash);
+      if (!match) return res.status(401).json({ error: 'Current password is incorrect.' });
       if (newPassword.length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters.' });
-      user.passwordHash = await bcrypt.hash(newPassword, 12);
+      updates.password_hash = await bcrypt.hash(newPassword, 12);
     }
 
-    db.users[idx] = user;
-    writeDB(db);
+    const { data: updatedUser, error: updateError } = await supabase
+      .from('users')
+      .update(updates)
+      .eq('id', user.id)
+      .select()
+      .single();
 
-    const { passwordHash, ...profile } = user;
+    if (updateError) throw updateError;
+
+    const { password_hash, ...profile } = updatedUser;
     res.json({ message: 'Profile updated.', user: profile });
   } catch (err) {
     next(err);
